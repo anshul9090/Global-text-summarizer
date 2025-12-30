@@ -1,0 +1,9 @@
+flask
+google-generativeai
+python-docx
+pillow
+pytesseract
+pdfminer.six
+pdf2image
+requests
+beautifulsoup4
