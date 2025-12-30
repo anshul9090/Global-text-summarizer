@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string, jsonify
-import google.generativeai as genai
+from google.genai import Client
 import os
 import docx
 from PIL import Image
@@ -13,53 +13,44 @@ import logging
 
 app = Flask(__name__)
 
-# Configure logging for debugging
+# -------------------- Logging --------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 🔑 Gemini API Key
+# -------------------- Gemini API Key --------------------
 API_KEY = os.getenv("GEMINI_API_KEY")
-
 if not API_KEY:
-    raise ValueError("GEMINI_API_KEY not set")
-genai.configure(api_key=API_KEY)
+    raise ValueError("⚠️ GEMINI_API_KEY not set! Set it as an environment variable.")
+client = Client(api_key=API_KEY)
 
-# ========== Configure Tesseract Path ==========
+# -------------------- Tesseract --------------------
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 if os.path.exists(TESSERACT_PATH):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 else:
-    pytesseract.pytesseract.tesseract_cmd = "tesseract"  # fallback (Linux/Mac)
+    pytesseract.pytesseract.tesseract_cmd = "tesseract"
     logging.warning("Tesseract not found at default path. Install from https://github.com/UB-Mannheim/tesseract/wiki")
 
-# ========== History Storage ==========
+# -------------------- History Storage --------------------
 summaries_history = []  # Store up to 5 recent summaries
 
-# ========== Helper Functions ==========
-
+# -------------------- Helper Functions --------------------
 def extract_pdf_text(file_path, ocr_lang="eng"):
-    """Extract text from PDF with optimized processing."""
     try:
         logging.info(f"Extracting text from PDF: {file_path}")
         text = extract_text(file_path)
         if text.strip():
             return text
-        # OCR fallback (limit to first page for speed)
+        # OCR fallback (first page only for speed)
         images = convert_from_path(file_path, first_page=1, last_page=1)
         ocr_text = ""
         for img in images:
-            try:
-                ocr_text += pytesseract.image_to_string(img, lang=ocr_lang, config='--psm 6') + "\n"
-            except Exception as e:
-                logging.error(f"OCR error: {str(e)}")
-                return f"⚠️ OCR error: {str(e)}"
+            ocr_text += pytesseract.image_to_string(img, lang=ocr_lang, config='--psm 6') + "\n"
         return ocr_text if ocr_text.strip() else "⚠️ No readable text found."
     except Exception as e:
         logging.error(f"Error extracting PDF text: {str(e)}")
         return f"⚠️ Error extracting PDF text: {str(e)}"
 
 def extract_docx_text(file_path):
-    """Extract text from DOCX."""
     try:
         logging.info(f"Extracting text from DOCX: {file_path}")
         doc = docx.Document(file_path)
@@ -69,26 +60,21 @@ def extract_docx_text(file_path):
         return f"⚠️ Error extracting DOCX: {str(e)}"
 
 def extract_image_text(file_path, ocr_lang="eng"):
-    """Extract text from images with optimized OCR."""
     try:
         logging.info(f"Extracting text from image: {file_path}")
         image = Image.open(file_path)
-        # Resize image to reduce OCR processing time (max width 1000px)
         image.thumbnail((1000, 1000))
         text = pytesseract.image_to_string(image, lang=ocr_lang, config='--psm 6')
-        if not text.strip():
-            return "⚠️ OCR did not detect any text. Try English (eng) or check image quality."
-        return text
+        return text if text.strip() else "⚠️ OCR did not detect any text."
     except Exception as e:
         logging.error(f"OCR error: {str(e)}")
         return f"⚠️ OCR error: {str(e)}"
 
-# ========== Flask Routes ==========
-
+# -------------------- Flask Routes --------------------
 @app.route("/", methods=["GET"])
 def index():
-    # Render initial page
     return render_template_string(html_code, summary="", error_msg="", summaries_history=summaries_history)
+
 @app.route("/process", methods=["POST"])
 def process():
     summary = ""
@@ -103,14 +89,10 @@ def process():
     summary_length = request.form.get("summary_length") or "Medium"
     summary_format = request.form.get("summary_format") or "Paragraph"
 
-    # Map summary length to word limit
     length_map = {"Short": 100, "Medium": 200, "Long": 300}
     word_limit = length_map.get(summary_length, 200)
-
-    # Map format
     format_prompt = "as a paragraph" if summary_format == "Paragraph" else "in bullet points"
 
-    # Map dropdown choice → Tesseract language codes
     ocr_lang_map = {
         "English": "eng", "Hindi": "hin", "French": "fra", "Spanish": "spa",
         "German": "deu", "Chinese": "chi_sim", "Japanese": "jpn"
@@ -118,79 +100,66 @@ def process():
     ocr_lang = ocr_lang_map.get(input_lang, "eng")
 
     extracted_text = ""
+
+    # -------- File Upload --------
     if uploaded_file:
         valid_extensions = {'.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg'}
         file_ext = os.path.splitext(uploaded_file.filename)[1].lower()
         if file_ext not in valid_extensions:
-            error_msg = f"⚠️ Unsupported file type: {file_ext}. Please upload a PDF, DOCX, TXT, PNG, or JPG file."
+            error_msg = f"⚠️ Unsupported file type: {file_ext}."
         else:
             file_path = os.path.join("Uploads", uploaded_file.filename)
-            try:
-                logging.info(f"Saving uploaded file: {file_path}")
-                uploaded_file.save(file_path)
-                if file_ext == '.pdf':
-                    extracted_text = extract_pdf_text(file_path, ocr_lang)
-                elif file_ext == '.docx':
-                    extracted_text = extract_docx_text(file_path)
-                elif file_ext == '.txt':
-                    extracted_text = open(file_path, "r", encoding="utf-8").read()
-                elif file_ext in {'.png', '.jpg', '.jpeg'}:
-                    extracted_text = extract_image_text(file_path, ocr_lang)
-            except Exception as e:
-                logging.error(f"Error processing file: {str(e)}")
-                error_msg = f"⚠️ Error processing file: {str(e)}"
-            finally:
-                if os.path.exists(file_path):
-                    try:
-                        os.remove(file_path)
-                        logging.info(f"Cleaned up file: {file_path}")
-                    except Exception as e:
-                        logging.error(f"Error cleaning up file: {str(e)}")
+            os.makedirs("Uploads", exist_ok=True)
+            uploaded_file.save(file_path)
+            if file_ext == '.pdf':
+                extracted_text = extract_pdf_text(file_path, ocr_lang)
+            elif file_ext == '.docx':
+                extracted_text = extract_docx_text(file_path)
+            elif file_ext == '.txt':
+                extracted_text = open(file_path, "r", encoding="utf-8").read()
+            elif file_ext in {'.png', '.jpg', '.jpeg'}:
+                extracted_text = extract_image_text(file_path, ocr_lang)
+            os.remove(file_path)
+
+    # -------- URL Input --------
     elif url_input:
         try:
             logging.info(f"Fetching URL: {url_input}")
-            headers = {
-                "User-Agent": "GlobalTextSummarizerBot/1.0"
-            }
-            response = requests.get(url_input, headers=headers, timeout=5)
+            response = requests.get(url_input, headers={"User-Agent": "GlobalTextSummarizerBot/1.0"}, timeout=5)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             extracted_text = soup.get_text(separator="\n", strip=True)
-        except requests.exceptions.HTTPError as http_err:
-            logging.error(f"HTTP error fetching URL: {str(http_err)}")
-            error_msg = f"⚠️ HTTP error fetching URL: {str(http_err)}"
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logging.error(f"Error fetching URL: {str(e)}")
             error_msg = f"⚠️ Error fetching URL: {str(e)}"
+
+    # -------- Text Input --------
     elif text_input:
         extracted_text = text_input
 
-    if extracted_text.strip():
-        if extracted_text.startswith("⚠️"):
-            error_msg = extracted_text
-        else:
-            try:
-                logging.info("Starting summarization using gemini-1.5-turbo")
-                # Updated to current Gemini model
-                model = genai.GenerativeModel("gemini-flash-latest")
-                response = model.generate_content(
-                    f"Summarize the following text in {output_lang} {format_prompt}. "
-                    f"Keep it concise (~{word_limit} words max):\n\n{extracted_text}"
-                )
-                summary = response.text
-                summaries_history.append({
-                    "timestamp": timestamp,
-                    "summary": summary,
-                    "language": output_lang,
-                    "length": summary_length,
-                    "format": summary_format
-                })
-                if len(summaries_history) > 5:
-                    summaries_history.pop(0)
-                logging.info("Summarization completed")
-            except Exception as e:
-                logging.error(f"Summarization error: {str(e)}")
-                error_msg = f"⚠️ Summarization error: {str(e)}"
+    # -------- Summarization --------
+    if extracted_text.strip() and not extracted_text.startswith("⚠️"):
+        try:
+            logging.info("Starting summarization using gemini-1.5-turbo")
+            response = client.generate_text(
+                model="gemini-1.5-turbo",
+                prompt=f"Summarize the following text in {output_lang} {format_prompt}. "
+                       f"Keep it concise (~{word_limit} words max):\n\n{extracted_text}",
+                max_output_tokens=word_limit * 2  # token ≈ 0.5 words
+            )
+            summary = response.text
+            summaries_history.append({
+                "timestamp": timestamp,
+                "summary": summary,
+                "language": output_lang,
+                "length": summary_length,
+                "format": summary_format
+            })
+            if len(summaries_history) > 5:
+                summaries_history.pop(0)
+        except Exception as e:
+            logging.error(f"Summarization error: {str(e)}")
+            error_msg = f"⚠️ Summarization error: {str(e)}"
 
     return jsonify({
         "summary": summary,
