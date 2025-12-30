@@ -1,5 +1,6 @@
 from flask import Flask, request, render_template_string, jsonify
-from google.genai import Client
+from flask import Flask, request, render_template_string, jsonify
+import google.generativeai as genai
 import os
 import docx
 from PIL import Image
@@ -20,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     raise ValueError("⚠️ GEMINI_API_KEY not set! Set it as an environment variable.")
-client = Client(api_key=API_KEY)
+genai.configure(api_key=API_KEY)
 
 # -------------------- Tesseract --------------------
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -40,7 +41,6 @@ def extract_pdf_text(file_path, ocr_lang="eng"):
         text = extract_text(file_path)
         if text.strip():
             return text
-        # OCR fallback (first page only for speed)
         images = convert_from_path(file_path, first_page=1, last_page=1)
         ocr_text = ""
         for img in images:
@@ -108,15 +108,16 @@ def process():
         if file_ext not in valid_extensions:
             error_msg = f"⚠️ Unsupported file type: {file_ext}."
         else:
-            file_path = os.path.join("Uploads", uploaded_file.filename)
             os.makedirs("Uploads", exist_ok=True)
+            file_path = os.path.join("Uploads", uploaded_file.filename)
             uploaded_file.save(file_path)
             if file_ext == '.pdf':
                 extracted_text = extract_pdf_text(file_path, ocr_lang)
             elif file_ext == '.docx':
                 extracted_text = extract_docx_text(file_path)
             elif file_ext == '.txt':
-                extracted_text = open(file_path, "r", encoding="utf-8").read()
+                with open(file_path, "r", encoding="utf-8") as f:
+                    extracted_text = f.read()
             elif file_ext in {'.png', '.jpg', '.jpeg'}:
                 extracted_text = extract_image_text(file_path, ocr_lang)
             os.remove(file_path)
@@ -140,12 +141,12 @@ def process():
     # -------- Summarization --------
     if extracted_text.strip() and not extracted_text.startswith("⚠️"):
         try:
-            logging.info("Starting summarization using gemini-1.5-turbo")
-            response = client.generate_text(
+            logging.info("Starting summarization using Gemini API")
+            response = genai.generate_text(
                 model="gemini-1.5-turbo",
                 prompt=f"Summarize the following text in {output_lang} {format_prompt}. "
                        f"Keep it concise (~{word_limit} words max):\n\n{extracted_text}",
-                max_output_tokens=word_limit * 2  # token ≈ 0.5 words
+                max_output_tokens=word_limit * 2
             )
             summary = response.text
             summaries_history.append({
