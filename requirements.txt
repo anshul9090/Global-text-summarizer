@@ -1,10 +1,10 @@
-flask
-google-genai
+Flask==2.3.3
+google-generativeai
 python-docx
-pillow
-pytesseract
 pdfminer.six
+Pillow==9.5.0
+pytesseract==0.3.13
 pdf2image
-requests
 beautifulsoup4
+requests
 gunicorn

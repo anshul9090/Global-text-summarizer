@@ -1,2 +1,2 @@
-#!/usr/bin/env bash
-gunicorn app:app
+#!/bin/bash
+gunicorn api.index:app
