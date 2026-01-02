@@ -1,5 +1,4 @@
-from flask import Flask, request, render_template_string, jsonify
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, jsonify
 import google.generativeai as genai
 import os
 import docx
@@ -11,168 +10,155 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 import logging
+import tempfile
 
+# -------------------- App --------------------
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# -------------------- Logging --------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# -------------------- Gemini API Key --------------------
+# -------------------- Gemini API --------------------
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
-    raise ValueError("⚠️ GEMINI_API_KEY not set! Set it as an environment variable.")
-genai.configure(api_key=API_KEY)
+    raise RuntimeError("❌ GEMINI_API_KEY not set in environment variables")
 
-# -------------------- Tesseract --------------------
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if os.path.exists(TESSERACT_PATH):
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-else:
-    pytesseract.pytesseract.tesseract_cmd = "tesseract"
-    logging.warning("Tesseract not found at default path. Install from https://github.com/UB-Mannheim/tesseract/wiki")
+client = genai.Client(api_key=API_KEY)
 
-# -------------------- History Storage --------------------
-summaries_history = []  # Store up to 5 recent summaries
+# -------------------- OCR --------------------
+pytesseract.pytesseract.tesseract_cmd = "tesseract"
 
-# -------------------- Helper Functions --------------------
-def extract_pdf_text(file_path, ocr_lang="eng"):
+# -------------------- Memory --------------------
+summaries_history = []
+
+# -------------------- Helpers --------------------
+def extract_pdf_text(path):
     try:
-        logging.info(f"Extracting text from PDF: {file_path}")
-        text = extract_text(file_path)
+        text = extract_text(path)
         if text.strip():
             return text
-        images = convert_from_path(file_path, first_page=1, last_page=1)
-        ocr_text = ""
-        for img in images:
-            ocr_text += pytesseract.image_to_string(img, lang=ocr_lang, config='--psm 6') + "\n"
-        return ocr_text if ocr_text.strip() else "⚠️ No readable text found."
-    except Exception as e:
-        logging.error(f"Error extracting PDF text: {str(e)}")
-        return f"⚠️ Error extracting PDF text: {str(e)}"
 
-def extract_docx_text(file_path):
+        images = convert_from_path(path, first_page=1, last_page=1)
+        return "".join(pytesseract.image_to_string(img) for img in images)
+
+    except Exception as e:
+        logging.error(e)
+        return f"PDF error: {e}"
+
+def extract_docx_text(path):
     try:
-        logging.info(f"Extracting text from DOCX: {file_path}")
-        doc = docx.Document(file_path)
-        return "\n".join([para.text for para in doc.paragraphs])
+        doc = docx.Document(path)
+        return "\n".join(p.text for p in doc.paragraphs)
     except Exception as e:
-        logging.error(f"Error extracting DOCX: {str(e)}")
-        return f"⚠️ Error extracting DOCX: {str(e)}"
+        logging.error(e)
+        return f"DOCX error: {e}"
 
-def extract_image_text(file_path, ocr_lang="eng"):
+def extract_image_text(path):
     try:
-        logging.info(f"Extracting text from image: {file_path}")
-        image = Image.open(file_path)
-        image.thumbnail((1000, 1000))
-        text = pytesseract.image_to_string(image, lang=ocr_lang, config='--psm 6')
-        return text if text.strip() else "⚠️ OCR did not detect any text."
+        img = Image.open(path)
+        return pytesseract.image_to_string(img)
     except Exception as e:
-        logging.error(f"OCR error: {str(e)}")
-        return f"⚠️ OCR error: {str(e)}"
+        logging.error(e)
+        return f"OCR error: {e}"
 
-# -------------------- Flask Routes --------------------
+# -------------------- Routes --------------------
 @app.route("/", methods=["GET"])
-def index():
-    return render_template_string(html_code, summary="", error_msg="", summaries_history=summaries_history)
+def home():
+    return jsonify({"status": "Global Text Summarizer API running"})
 
 @app.route("/process", methods=["POST"])
 def process():
+    extracted_text = ""
     summary = ""
-    error_msg = ""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    error = ""
 
-    text_input = request.form.get("text_input")
-    url_input = request.form.get("url_input")
-    uploaded_file = request.files.get("file")
-    input_lang = request.form.get("input_lang") or "English"
-    output_lang = request.form.get("output_lang") or "English"
-    summary_length = request.form.get("summary_length") or "Medium"
-    summary_format = request.form.get("summary_format") or "Paragraph"
+    text_input = request.form.get("text")
+    url_input = request.form.get("url")
+    file = request.files.get("file")
+
+    output_lang = request.form.get("output_lang", "English")
+    summary_length = request.form.get("summary_length", "Medium")
 
     length_map = {"Short": 100, "Medium": 200, "Long": 300}
     word_limit = length_map.get(summary_length, 200)
-    format_prompt = "as a paragraph" if summary_format == "Paragraph" else "in bullet points"
 
-    ocr_lang_map = {
-        "English": "eng", "Hindi": "hin", "French": "fra", "Spanish": "spa",
-        "German": "deu", "Chinese": "chi_sim", "Japanese": "jpn"
-    }
-    ocr_lang = ocr_lang_map.get(input_lang, "eng")
+    # ---------- File ----------
+    if file:
+        suffix = os.path.splitext(file.filename)[1].lower()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            file.save(tmp.name)
+            path = tmp.name
 
-    extracted_text = ""
-
-    # -------- File Upload --------
-    if uploaded_file:
-        valid_extensions = {'.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg'}
-        file_ext = os.path.splitext(uploaded_file.filename)[1].lower()
-        if file_ext not in valid_extensions:
-            error_msg = f"⚠️ Unsupported file type: {file_ext}."
-        else:
-            os.makedirs("Uploads", exist_ok=True)
-            file_path = os.path.join("Uploads", uploaded_file.filename)
-            uploaded_file.save(file_path)
-            if file_ext == '.pdf':
-                extracted_text = extract_pdf_text(file_path, ocr_lang)
-            elif file_ext == '.docx':
-                extracted_text = extract_docx_text(file_path)
-            elif file_ext == '.txt':
-                with open(file_path, "r", encoding="utf-8") as f:
+        try:
+            if suffix == ".pdf":
+                extracted_text = extract_pdf_text(path)
+            elif suffix == ".docx":
+                extracted_text = extract_docx_text(path)
+            elif suffix in [".png", ".jpg", ".jpeg"]:
+                extracted_text = extract_image_text(path)
+            elif suffix == ".txt":
+                with open(path, "r", encoding="utf-8") as f:
                     extracted_text = f.read()
-            elif file_ext in {'.png', '.jpg', '.jpeg'}:
-                extracted_text = extract_image_text(file_path, ocr_lang)
-            os.remove(file_path)
+            else:
+                error = "Unsupported file type"
+        finally:
+            os.remove(path)
 
-    # -------- URL Input --------
+    # ---------- URL ----------
     elif url_input:
         try:
-            logging.info(f"Fetching URL: {url_input}")
-            response = requests.get(url_input, headers={"User-Agent": "GlobalTextSummarizerBot/1.0"}, timeout=5)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            extracted_text = soup.get_text(separator="\n", strip=True)
+            res = requests.get(url_input, timeout=10)
+            res.raise_for_status()
+            soup = BeautifulSoup(res.text, "html.parser")
+            extracted_text = soup.get_text(separator="\n")
         except Exception as e:
-            logging.error(f"Error fetching URL: {str(e)}")
-            error_msg = f"⚠️ Error fetching URL: {str(e)}"
+            error = f"URL error: {e}"
 
-    # -------- Text Input --------
+    # ---------- Text ----------
     elif text_input:
         extracted_text = text_input
 
-    # -------- Summarization --------
-    if extracted_text.strip() and not extracted_text.startswith("⚠️"):
+    else:
+        error = "No input provided"
+
+    # ---------- Gemini Summarization ----------
+    if extracted_text and not error:
         try:
-            logging.info("Starting summarization using Gemini API")
-            response = genai.generate_text(
+            response = client.generate_text(
                 model="gemini-1.5-turbo",
-                prompt=f"Summarize the following text in {output_lang} {format_prompt}. "
-                       f"Keep it concise (~{word_limit} words max):\n\n{extracted_text}",
+                prompt=f"Summarize in {output_lang} within {word_limit} words:\n\n{extracted_text}",
                 max_output_tokens=word_limit * 2
             )
+
             summary = response.text
+
             summaries_history.append({
-                "timestamp": timestamp,
-                "summary": summary,
-                "language": output_lang,
-                "length": summary_length,
-                "format": summary_format
+                "time": datetime.now().isoformat(),
+                "summary": summary
             })
-            if len(summaries_history) > 5:
-                summaries_history.pop(0)
+
+            # Keep last 5 summaries
+            summaries_history[:] = summaries_history[-5:]
+
         except Exception as e:
-            logging.error(f"Summarization error: {str(e)}")
-            error_msg = f"⚠️ Summarization error: {str(e)}"
+            logging.error(e)
+            error = f"Gemini error: {e}"
 
     return jsonify({
         "summary": summary,
-        "error_msg": error_msg,
-        "summaries_history": summaries_history
+        "error": error,
+        "history": summaries_history
     })
 
-
-@app.route("/clear_history", methods=["POST"])
-def clear_history():
+@app.route("/clear", methods=["POST"])
+def clear():
     summaries_history.clear()
-    return jsonify({"summaries_history": summaries_history})
+    return jsonify({"status": "history cleared"})
+
+# -------------------- Render Entry --------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+
 
 # ========== HTML Template ==========
 html_code = """
