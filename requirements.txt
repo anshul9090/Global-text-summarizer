@@ -1,9 +1,10 @@
-Flask
+flask
 google-genai
 python-docx
-Pillow
+pillow
 pytesseract
 pdfminer.six
 pdf2image
 requests
 beautifulsoup4
+gunicorn
