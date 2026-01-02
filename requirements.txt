@@ -1,8 +1,10 @@
 Flask==2.3.3
+google-generativeai
+python-docx
+pdfminer.six
+Pillow==9.5.0
 pytesseract==0.3.13
-Pillow==10.1.0
-pdfminer.six==20221105
-pdf2image==1.16.3
-requests==2.31.0
-beautifulsoup4==4.12.2
-google-generativeai==0.1.2
+pdf2image
+beautifulsoup4
+requests
+gunicorn
