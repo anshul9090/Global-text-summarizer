@@ -1,9 +1,0 @@
-Flask
-google-genai
-python-docx
-Pillow
-pytesseract
-pdfminer.six
-pdf2image
-requests
-beautifulsoup4
