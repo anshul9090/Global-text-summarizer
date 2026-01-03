@@ -1,6 +1,7 @@
-from flask import Flask, request, jsonify
-import google.generativeai as genai
+from flask import Flask, request, render_template_string, jsonify
+from google import genai
 import os
+from dotenv import load_dotenv
 import docx
 from PIL import Image
 import pytesseract
@@ -10,155 +11,158 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 import logging
-import tempfile
 
-# -------------------- App --------------------
+# ---------------------- Setup ----------------------
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# -------------------- Gemini API --------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
+load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
-    raise RuntimeError("❌ GEMINI_API_KEY not set")
+    raise Exception("⚠️ Please set GEMINI_API_KEY in your .env file.")
 
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+# Create GenAI client
+client = genai.Client(api_key=API_KEY)
 
-# -------------------- OCR --------------------
-pytesseract.pytesseract.tesseract_cmd = "tesseract"
+# Tesseract OCR path
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+else:
+    pytesseract.pytesseract.tesseract_cmd = "tesseract"
+    logging.warning("Tesseract not found at default path. Install from https://github.com/UB-Mannheim/tesseract/wiki")
 
-# -------------------- Memory --------------------
+# History
 summaries_history = []
 
-# -------------------- Helpers --------------------
-def extract_pdf_text(path):
+# ---------------------- Helper Functions ----------------------
+def extract_pdf_text(file_path, ocr_lang="eng"):
     try:
-        text = extract_text(path)
+        text = extract_text(file_path)
         if text.strip():
             return text
-
-        images = convert_from_path(path, first_page=1, last_page=1)
-        return "".join(pytesseract.image_to_string(img) for img in images)
-
+        # OCR fallback for first page
+        images = convert_from_path(file_path, first_page=1, last_page=1)
+        ocr_text = ""
+        for img in images:
+            ocr_text += pytesseract.image_to_string(img, lang=ocr_lang, config='--psm 6') + "\n"
+        return ocr_text if ocr_text.strip() else "⚠️ No readable text found."
     except Exception as e:
-        logging.error(e)
-        return f"PDF error: {e}"
+        logging.error(f"PDF extraction error: {str(e)}")
+        return f"⚠️ Error extracting PDF text: {str(e)}"
 
-def extract_docx_text(path):
+def extract_docx_text(file_path):
     try:
-        doc = docx.Document(path)
-        return "\n".join(p.text for p in doc.paragraphs)
+        doc = docx.Document(file_path)
+        return "\n".join([para.text for para in doc.paragraphs])
     except Exception as e:
-        logging.error(e)
-        return f"DOCX error: {e}"
+        logging.error(f"DOCX extraction error: {str(e)}")
+        return f"⚠️ Error extracting DOCX: {str(e)}"
 
-def extract_image_text(path):
+def extract_image_text(file_path, ocr_lang="eng"):
     try:
-        img = Image.open(path)
-        return pytesseract.image_to_string(img)
+        img = Image.open(file_path)
+        img.thumbnail((1000,1000))
+        text = pytesseract.image_to_string(img, lang=ocr_lang, config='--psm 6')
+        return text if text.strip() else "⚠️ OCR did not detect any text."
     except Exception as e:
-        logging.error(e)
-        return f"OCR error: {e}"
+        logging.error(f"OCR error: {str(e)}")
+        return f"⚠️ OCR error: {str(e)}"
 
-# -------------------- Routes --------------------
+# ---------------------- Routes ----------------------
 @app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "Global Text Summarizer API running"})
+def index():
+    return render_template_string(html_code, summary="", error_msg="", summaries_history=summaries_history)
 
 @app.route("/process", methods=["POST"])
 def process():
-    extracted_text = ""
     summary = ""
-    error = ""
+    error_msg = ""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    text_input = request.form.get("text")
-    url_input = request.form.get("url")
-    file = request.files.get("file")
+    text_input = request.form.get("text_input")
+    url_input = request.form.get("url_input")
+    uploaded_file = request.files.get("file")
+    input_lang = request.form.get("input_lang") or "English"
+    output_lang = request.form.get("output_lang") or "English"
+    summary_length = request.form.get("summary_length") or "Medium"
+    summary_format = request.form.get("summary_format") or "Paragraph"
 
-    output_lang = request.form.get("output_lang", "English")
-    summary_length = request.form.get("summary_length", "Medium")
-
+    # Word limits
     length_map = {"Short": 100, "Medium": 200, "Long": 300}
     word_limit = length_map.get(summary_length, 200)
+    format_prompt = "as a paragraph" if summary_format == "Paragraph" else "in bullet points"
 
-    # ---------- File ----------
-    if file:
-        suffix = os.path.splitext(file.filename)[1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            file.save(tmp.name)
-            path = tmp.name
+    ocr_lang_map = {
+        "English": "eng", "Hindi": "hin", "French": "fra", "Spanish": "spa",
+        "German": "deu", "Chinese": "chi_sim", "Japanese": "jpn"
+    }
+    ocr_lang = ocr_lang_map.get(input_lang, "eng")
 
-        try:
-            if suffix == ".pdf":
-                extracted_text = extract_pdf_text(path)
-            elif suffix == ".docx":
-                extracted_text = extract_docx_text(path)
-            elif suffix in [".png", ".jpg", ".jpeg"]:
-                extracted_text = extract_image_text(path)
-            elif suffix == ".txt":
-                with open(path, "r", encoding="utf-8") as f:
+    extracted_text = ""
+    if uploaded_file:
+        valid_extensions = {'.pdf','.docx','.txt','.png','.jpg','.jpeg'}
+        file_ext = os.path.splitext(uploaded_file.filename)[1].lower()
+        if file_ext not in valid_extensions:
+            error_msg = f"⚠️ Unsupported file type: {file_ext}"
+        else:
+            file_path = os.path.join("Uploads", uploaded_file.filename)
+            os.makedirs("Uploads", exist_ok=True)
+            uploaded_file.save(file_path)
+            if file_ext == '.pdf':
+                extracted_text = extract_pdf_text(file_path, ocr_lang)
+            elif file_ext == '.docx':
+                extracted_text = extract_docx_text(file_path)
+            elif file_ext == '.txt':
+                with open(file_path, "r", encoding="utf-8") as f:
                     extracted_text = f.read()
-            else:
-                error = "Unsupported file type"
-        finally:
-            os.remove(path)
-
-    # ---------- URL ----------
+            elif file_ext in {'.png','.jpg','.jpeg'}:
+                extracted_text = extract_image_text(file_path, ocr_lang)
+            os.remove(file_path)
     elif url_input:
         try:
-            res = requests.get(url_input, timeout=10)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-            extracted_text = soup.get_text(separator="\n")
+            headers = {"User-Agent":"GlobalTextSummarizerBot/1.0"}
+            r = requests.get(url_input, headers=headers, timeout=5)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text,'html.parser')
+            extracted_text = soup.get_text(separator="\n",strip=True)
         except Exception as e:
-            error = f"URL error: {e}"
-
-    # ---------- Text ----------
+            error_msg = f"⚠️ Error fetching URL: {str(e)}"
     elif text_input:
         extracted_text = text_input
 
-    else:
-        error = "No input provided"
-
-    # ---------- Gemini Summarization ----------
-    if extracted_text and not error:
+    if extracted_text.strip() and not extracted_text.startswith("⚠️"):
         try:
-            prompt = (
-                f"Summarize the following text in {output_lang} "
-                f"within {word_limit} words:\n\n{extracted_text}"
+            # Use new GenAI client
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=f"Summarize the following text in {output_lang} {format_prompt}. Keep it concise (~{word_limit} words max):\n\n{extracted_text}"
             )
-
-            response = model.generate_content(prompt)
             summary = response.text
-
             summaries_history.append({
-                "time": datetime.now().isoformat(),
-                "summary": summary
+                "timestamp": timestamp,
+                "summary": summary,
+                "language": output_lang,
+                "length": summary_length,
+                "format": summary_format
             })
-
-            summaries_history[:] = summaries_history[-5:]
-
+            if len(summaries_history) > 5:
+                summaries_history.pop(0)
         except Exception as e:
-            logging.error(e)
-            error = f"Gemini error: {e}"
+            error_msg = f"⚠️ Summarization failed: {str(e)}"
 
     return jsonify({
         "summary": summary,
-        "error": error,
-        "history": summaries_history
+        "error_msg": error_msg,
+        "summaries_history": summaries_history
     })
 
-@app.route("/clear", methods=["POST"])
-def clear():
+@app.route("/clear_history", methods=["POST"])
+def clear_history():
     summaries_history.clear()
-    return jsonify({"status": "history cleared"})
-
-# -------------------- Render Entry --------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-
+    return jsonify({"summaries_history": summaries_history})
 # ========== HTML Template ==========
 html_code = """
 <!DOCTYPE html>
@@ -573,171 +577,146 @@ html_code = """
       </div>
     </div>
   </div>
+<script>
+  // Initialize particles.js
+  particlesJS('particles-js', {
+    particles: {
+      number: { value: 80, density: { enable: true, value_area: 800 } },
+      color: { value: '#e2e8f0' },
+      shape: { type: 'circle' },
+      opacity: { value: 0.4, random: true },
+      size: { value: 3, random: true },
+      line_linked: { enable: true, distance: 150, color: '#e2e8f0', opacity: 0.3, width: 1 },
+      move: { enable: true, speed: 2, direction: 'none', random: true, out_mode: 'out' }
+    },
+    interactivity: {
+      detect_on: 'canvas',
+      events: { onhover: { enable: true, mode: 'repulse' }, onclick: { enable: true, mode: 'push' }, resize: true },
+      modes: { repulse: { distance: 100, duration: 0.4 }, push: { particles_nb: 4 } }
+    },
+    retina_detect: true
+  });
 
-  <script>
-    // Initialize particles.js
-    particlesJS('particles-js', {
-      particles: {
-        number: { value: 80, density: { enable: true, value_area: 800 } },
-        color: { value: '#e2e8f0' },
-        shape: { type: 'circle' },
-        opacity: { value: 0.4, random: true },
-        size: { value: 3, random: true },
-        line_linked: { enable: true, distance: 150, color: '#e2e8f0', opacity: 0.3, width: 1 },
-        move: { enable: true, speed: 2, direction: 'none', random: true, out_mode: 'out' }
-      },
-      interactivity: {
-        detect_on: 'canvas',
-        events: { onhover: { enable: true, mode: 'repulse' }, onclick: { enable: true, mode: 'push' }, resize: true },
-        modes: { repulse: { distance: 100, duration: 0.4 }, push: { particles_nb: 4 } }
-      },
-      retina_detect: true
-    });
+  const fileInput = document.getElementById('fileInput');
+  const fileContainer = document.getElementById('fileContainer');
+  const fileContainerText = document.getElementById('fileContainerText');
+  const form = document.getElementById('uploadForm');
+  const toggleHistoryBtn = document.getElementById('toggleHistory');
+  const historyBox = document.getElementById('historyBox');
+  const toggleThemeBtn = document.getElementById('toggleTheme');
+  const clearHistoryBtn = document.getElementById('clearHistory');
+  const summaryBox = document.getElementById('summaryBox');
+  const summaryText = document.getElementById('summaryText');
+  const errorBox = document.getElementById('errorBox');
+  const errorText = document.getElementById('errorText');
+  const historyContent = document.getElementById('historyContent');
+  const body = document.body;
 
-    const fileInput = document.getElementById('fileInput');
-    const fileContainer = document.getElementById('fileContainer');
-    const fileContainerText = document.getElementById('fileContainerText');
-    const form = document.getElementById('uploadForm');
-    const toggleHistoryBtn = document.getElementById('toggleHistory');
-    const historyBox = document.getElementById('historyBox');
-    const toggleThemeBtn = document.getElementById('toggleTheme');
-    const clearHistoryBtn = document.getElementById('clearHistory');
-    const summaryBox = document.getElementById('summaryBox');
-    const summaryText = document.getElementById('summaryText');
-    const errorBox = document.getElementById('errorBox');
-    const errorText = document.getElementById('errorText');
-    const historyContent = document.getElementById('historyContent');
-    const body = document.body;
-
-    // Handle file selection
-    fileInput.addEventListener('change', () => {
-      if (fileInput.files.length > 0) {
-        const file = fileInput.files[0];
-        const validExtensions = ['.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg'];
-        const fileExt = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
-        if (!validExtensions.includes(fileExt)) {
-          fileContainerText.textContent = 'Invalid file type! Please use PDF, DOCX, TXT, PNG, or JPG';
-          fileContainer.style.borderColor = '#e53e3e';
-          setTimeout(() => {
-            fileContainerText.textContent = 'Click to select a file';
-            fileContainer.style.borderColor = body.classList.contains('dark-mode') ? '#63b3ed' : '#2b6cb0';
-            fileInput.value = '';
-          }, 2000);
-        } else {
-          fileContainerText.textContent = `Selected: ${file.name}`;
-        }
+  // Handle file selection
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length > 0) {
+      const file = fileInput.files[0];
+      const validExtensions = ['.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg'];
+      const fileExt = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+      if (!validExtensions.includes(fileExt)) {
+        fileContainerText.textContent = 'Invalid file type! Please use PDF, DOCX, TXT, PNG, or JPG';
+        fileContainer.style.borderColor = '#e53e3e';
+        setTimeout(() => {
+          fileContainerText.textContent = 'Click to select a file';
+          fileContainer.style.borderColor = body.classList.contains('dark-mode') ? '#63b3ed' : '#2b6cb0';
+          fileInput.value = '';
+        }, 2000);
       } else {
-        fileContainerText.textContent = 'Click to select a file';
+        fileContainerText.textContent = `Selected: ${file.name}`;
       }
-    });
+    } else {
+      fileContainerText.textContent = 'Click to select a file';
+    }
+  });
 
-    // Handle click on file container to trigger file input
-    fileContainer.addEventListener('click', () => {
-      fileInput.click();
-    });
+  // Handle click on file container to trigger file input
+  fileContainer.addEventListener('click', () => {
+    fileInput.click();
+  });
 
-    // Handle form submission via AJAX
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const formData = new FormData(form);
-      summaryBox.style.display = 'none';
-      errorBox.style.display = 'none';
-      fileContainer.classList.add('processing');
+  // Handle form submission via AJAX
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault(); // Prevent page reload
 
-      try {
-        const response = await fetch('/process', {
-          method: 'POST',
-          body: formData
-        });
-        const data = await response.json();
+    summaryBox.style.display = 'none';
+    errorBox.style.display = 'none';
+    fileContainer.classList.add('processing');
 
-        fileContainer.classList.remove('processing');
-        fileContainerText.textContent = 'Click to select a file';
-        fileInput.value = ''; // Clear file input
+    const formData = new FormData(form);
 
-        if (data.error_msg) {
-          errorText.textContent = data.error_msg;
-          errorBox.style.display = 'block';
-          errorBox.style.animation = 'fadeInUp 0.6s ease-out';
-        } else if (data.summary) {
-          summaryText.textContent = data.summary;
-          summaryBox.style.display = 'block';
-          summaryBox.style.animation = 'fadeInUp 0.6s ease-out';
-        }
+    try {
+      const response = await fetch('/process', { method: 'POST', body: formData });
+      const data = await response.json();
 
-        // Update history
-        historyContent.innerHTML = '';
-        data.summaries_history.forEach(item => {
-          const historyItem = document.createElement('div');
-          historyItem.className = 'history-item';
-          historyItem.innerHTML = `
-            <p><b>Time:</b> ${item.timestamp} | <b>Language:</b> ${item.language} | <b>Length:</b> ${item.length} | <b>Format:</b> ${item.format}</p>
-            <p>${item.summary}</p>
-          `;
-          historyContent.appendChild(historyItem);
-        });
-      } catch (error) {
-        fileContainer.classList.remove('processing');
-        fileContainerText.textContent = 'Click to select a file';
-        fileInput.value = '';
-        errorText.textContent = '⚠️ Network error: Unable to process request.';
+      fileContainer.classList.remove('processing');
+      fileContainerText.textContent = 'Click to select a file';
+      fileInput.value = '';
+
+      if (data.error_msg) {
+        errorText.textContent = data.error_msg;
         errorBox.style.display = 'block';
-        errorBox.style.animation = 'fadeInUp 0.6s ease-out';
+      } else if (data.summary) {
+        summaryText.textContent = data.summary;
+        summaryBox.style.display = 'block';
       }
-    });
 
-    // Handle clear history via AJAX
-    clearHistoryBtn.addEventListener('click', async () => {
-      try {
-        const response = await fetch('/clear_history', {
-          method: 'POST'
-        });
-        const data = await response.json();
-        historyContent.innerHTML = '';
-        historyBox.style.display = 'none';
-        toggleHistoryBtn.textContent = '📜 Show History';
-      } catch (error) {
-        errorText.textContent = '⚠️ Network error: Unable to clear history.';
-        errorBox.style.display = 'block';
-        errorBox.style.animation = 'fadeInUp 0.6s ease-out';
-      }
-    });
-
-    toggleHistoryBtn.addEventListener('click', () => {
-      if (historyBox.style.display === 'none' || historyBox.style.display === '') {
-        historyBox.style.display = 'block';
-        historyBox.style.animation = 'fadeInUp 0.6s ease-out';
-        toggleHistoryBtn.textContent = '📜 Hide History';
-      } else {
-        historyBox.style.animation = 'fadeInUp 0.6s ease-out reverse';
-        setTimeout(() => { historyBox.style.display = 'none'; }, 600);
-        toggleHistoryBtn.textContent = '📜 Show History';
-      }
-    });
-
-    toggleThemeBtn.addEventListener('click', () => {
-      body.classList.toggle('dark-mode');
-      toggleThemeBtn.textContent = body.classList.contains('dark-mode') ? '☀️ Light Mode' : '🌙 Dark Mode';
-      particlesJS('particles-js', {
-        particles: {
-          number: { value: 80, density: { enable: true, value_area: 800 } },
-          color: { value: body.classList.contains('dark-mode') ? '#a0aec0' : '#e2e8f0' },
-          shape: { type: 'circle' },
-          opacity: { value: 0.4, random: true },
-          size: { value: 3, random: true },
-          line_linked: { enable: true, distance: 150, color: body.classList.contains('dark-mode') ? '#a0aec0' : '#e2e8f0', opacity: 0.3, width: 1 },
-          move: { enable: true, speed: 2, direction: 'none', random: true, out_mode: 'out' }
-        },
-        interactivity: {
-          detect_on: 'canvas',
-          events: { onhover: { enable: true, mode: 'repulse' }, onclick: { enable: true, mode: 'push' }, resize: true },
-          modes: { repulse: { distance: 100, duration: 0.4 }, push: { particles_nb: 4 } }
-        },
-        retina_detect: true
+      // Update history
+      historyContent.innerHTML = '';
+      data.summaries_history.forEach(item => {
+        const historyItem = document.createElement('div');
+        historyItem.className = 'history-item';
+        historyItem.innerHTML = `<p><b>Time:</b> ${item.timestamp} | <b>Language:</b> ${item.language} | <b>Length:</b> ${item.length} | <b>Format:</b> ${item.format}</p>
+                                 <p>${item.summary}</p>`;
+        historyContent.appendChild(historyItem);
       });
-    });
-  </script>
+    } catch (error) {
+      fileContainer.classList.remove('processing');
+      fileContainerText.textContent = 'Click to select a file';
+      fileInput.value = '';
+      errorText.textContent = '⚠️ Network error: Unable to process request.';
+      errorBox.style.display = 'block';
+    }
+  });
+
+  // Handle clear history via AJAX
+  clearHistoryBtn.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/clear_history', { method: 'POST' });
+      const data = await response.json();
+      historyContent.innerHTML = '';
+      historyBox.style.display = 'none';
+      toggleHistoryBtn.textContent = '📜 Show History';
+    } catch (error) {
+      errorText.textContent = '⚠️ Network error: Unable to clear history.';
+      errorBox.style.display = 'block';
+    }
+  });
+
+  toggleHistoryBtn.addEventListener('click', () => {
+    if (historyBox.style.display === 'none' || historyBox.style.display === '') {
+      historyBox.style.display = 'block';
+      toggleHistoryBtn.textContent = '📜 Hide History';
+    } else {
+      historyBox.style.display = 'none';
+      toggleHistoryBtn.textContent = '📜 Show History';
+    }
+  });
+
+  toggleThemeBtn.addEventListener('click', () => {
+    body.classList.toggle('dark-mode');
+    toggleThemeBtn.textContent = body.classList.contains('dark-mode') ? '☀️ Light Mode' : '🌙 Dark Mode';
+  });
+</script>
+
 </body>
 </html>
 """
-os.makedirs("Uploads", exist_ok=True)
+
+if __name__ == "__main__":
+    os.makedirs("Uploads", exist_ok=True)
+    app.run(debug=True)
