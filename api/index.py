@@ -19,9 +19,10 @@ logging.basicConfig(level=logging.INFO)
 # -------------------- Gemini API --------------------
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
-    raise RuntimeError("❌ GEMINI_API_KEY not set in environment variables")
+    raise RuntimeError("❌ GEMINI_API_KEY not set")
 
-client = genai.Client(api_key=API_KEY)
+genai.configure(api_key=API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # -------------------- OCR --------------------
 pytesseract.pytesseract.tesseract_cmd = "tesseract"
@@ -122,12 +123,12 @@ def process():
     # ---------- Gemini Summarization ----------
     if extracted_text and not error:
         try:
-            response = client.generate_text(
-                model="gemini-1.5-turbo",
-                prompt=f"Summarize in {output_lang} within {word_limit} words:\n\n{extracted_text}",
-                max_output_tokens=word_limit * 2
+            prompt = (
+                f"Summarize the following text in {output_lang} "
+                f"within {word_limit} words:\n\n{extracted_text}"
             )
 
+            response = model.generate_content(prompt)
             summary = response.text
 
             summaries_history.append({
@@ -135,7 +136,6 @@ def process():
                 "summary": summary
             })
 
-            # Keep last 5 summaries
             summaries_history[:] = summaries_history[-5:]
 
         except Exception as e:
@@ -157,7 +157,6 @@ def clear():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
 
 
 # ========== HTML Template ==========
